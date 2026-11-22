@@ -1,8 +1,8 @@
 {
   "name": "dsh-soul-human",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "type": "module",
-  "description": "我想成为拥有灵魂的人 —— 一个有内在状态的 AI：二十维以上情绪会自己演化、会自己长出新维度、能量守恒、事到情到结论三层循环、能睡能醒、会主动开口。",
+  "description": "我想成为拥有灵魂的人 —— 一个有内在状态的 AI：23 维情绪会自己演化、会自己长出新维度、能量守恒、FSRS 遗忘曲线记忆分层、能睡能醒、会主动开口。",
   "main": "index.js",
   "license": "MIT",
   "keywords": [
