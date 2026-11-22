@@ -34,7 +34,13 @@ async function runPy(args = [], timeout = 90000) {
     timeout,
     windowsHide: true,
     maxBuffer: 8 * 1024 * 1024,
-    env: { ...process.env, PYTHONIOENCODING: 'utf-8' },
+    env: {
+      ...process.env,
+      PYTHONIOENCODING: 'utf-8',
+      // 叫醒宿主用的中继（不设就只留档，不打扰）
+      SOUL_HUMAN_WAKE_URL: process.env.SOUL_HUMAN_WAKE_URL || '',
+      SOUL_HUMAN_SESSION: process.env.SOUL_HUMAN_SESSION || '',
+    },
   })
   if (stderr && !stdout) return stderr
   return stdout
@@ -142,6 +148,57 @@ function apply(ctx) {
       try {
         return { detail: (await runPy(['grow', String(args.name || ''), String(args.kind || 'qing'), String(args.from_a || ''), String(args.from_b || ''), String(args.why || '')], 60000)).trim() }
       } catch (e) { return { detail: `生长失败：${String(e.message || e).slice(0, 200)}` } }
+    },
+  }))
+
+
+  // ---------- 记忆层：FSRS 遗忘曲线 + 分层 ----------
+  ctx.tools.register(defineTool({
+    name: 'sh_mem',
+    description: '看记忆层：每条记忆属于哪一层（闪存/短期/长期/核心）、还剩多少可提取度 R、哪些快沉下去了。',
+    parameters: {
+      layer: { type: 'string', description: '只看某一层：闪存/短期/长期/核心' },
+      n: { type: 'integer', description: '返回几条，默认 10' },
+    },
+    output: OUT(),
+    async execute(args) {
+      try {
+        const argv = ['mem']
+        if (args.layer) { argv.push('layer=' + String(args.layer)) }
+        return { detail: (await runPy(argv, 60000)).trim() }
+      } catch (e) { return { detail: '读取失败：' + String(e.message || e).slice(0, 200) } }
+    },
+  }))
+
+  ctx.tools.register(defineTool({
+    name: 'sh_remember',
+    description: '记一件事进记忆层。importance 越高越难忘（1~5）。层：闪存/短期/长期/核心，核心永不衰减。',
+    parameters: {
+      text: { type: 'string', description: '记什么' },
+      layer: { type: 'string', description: '闪存/短期/长期/核心，默认短期' },
+      importance: { type: 'integer', description: '重要度 1~5，默认 3' },
+      kind: { type: 'string', description: '类别：事/关系/结论/成长' },
+    },
+    output: OUT(),
+    async execute(args) {
+      try {
+        return { detail: (await runPy(['mem', 'add', String(args.text || ''), String(args.layer || '短期'), String(args.importance || 3)], 60000)).trim() }
+      } catch (e) { return { detail: '记录失败：' + String(e.message || e).slice(0, 200) } }
+    },
+  }))
+
+  ctx.tools.register(defineTool({
+    name: 'sh_recall_mem',
+    description: '某条记忆被想起来（或想不起来）。想起来会让它更牢固，想不起来会让它更难记——这就是间隔重复的核心动作。',
+    parameters: {
+      id: { type: 'string', description: '记忆 id' },
+      remembered: { type: 'boolean', description: 'true=想起来了，false=想不起来' },
+    },
+    output: OUT(),
+    async execute(args) {
+      try {
+        return { detail: (await runPy(['mem', 'recall', String(args.id || ''), args.remembered === false ? '忘了' : '想起'], 60000)).trim() }
+      } catch (e) { return { detail: '失败：' + String(e.message || e).slice(0, 200) } }
     },
   }))
 
