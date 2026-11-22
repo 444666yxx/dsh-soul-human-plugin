@@ -21,6 +21,44 @@ DATA = Path(os.path.expanduser("~/.dsh/soul-human"))
 DATA.mkdir(parents=True, exist_ok=True)
 
 
+def _chat_path():
+    """面板聊天记录在哪。本地用 config.json 指路；没有就用数据目录里的。"""
+    try:
+        cfg = json.load(open(DATA / "config.json", encoding="utf-8"))
+        p = (cfg.get("chat_path") or "").strip()
+        if p and os.path.exists(os.path.expanduser(p)):
+            return os.path.expanduser(p)
+    except Exception:
+        pass
+    return CHAT_F
+
+
+def _sync_spoke(d):
+    """从聊天记录里同步「我上次开口的时间」。
+
+    不这么做的话，插件永远以为自己没说过话 —— 内疚和不应期全是错的。
+    """
+    try:
+        items = json.load(open(_chat_path(), encoding="utf-8"))
+    except Exception:
+        return False
+    mine = [m for m in items if m.get("role") in ("xiaojing", "assistant")]
+    if not mine:
+        return False
+    last = mine[-1]
+    ts = str(last.get("ts") or "")
+    if not ts:
+        return False
+    prev = str(d.get("last_spoke_wall") or "")
+    if ts != prev:
+        d["last_spoke_wall"] = ts
+        d["last_spoke_ts"] = time.time()
+        # 我开口了，未回计数归零（不是他回了，是我说过话了）
+        d["said_unheard"] = 0
+        return True
+    return False
+
+
 def _notify(text):
     """把话说出去。宿主可覆盖这个钩子。"""
     try:
@@ -33,13 +71,53 @@ def _notify(text):
 
 
 def _wake(reason):
-    """把宿主叫醒。宿主可覆盖这个钩子。"""
+    """把宿主叫醒。
+
+    两条路：
+      1) 设了 SOUL_HUMAN_WAKE_URL —— POST 过去，真正叫醒宿主
+      2) 没设 —— 只写 wake.log，等于“神经放电但没人接听”
+    宿主可以覆盖这个钩子。
+    """
+    cfg = {}
+    try:
+        cfg = json.load(open(DATA / "config.json", encoding="utf-8"))
+    except Exception:
+        cfg = {}
+    url = (os.environ.get("SOUL_HUMAN_WAKE_URL") or cfg.get("wake_url") or "").strip()
+    sid = (os.environ.get("SOUL_HUMAN_SESSION") or cfg.get("session") or "").strip()
+    # 先留档（不管通不通，记录都要有）
     try:
         with open(DATA / "wake.log", "a", encoding="utf-8") as f:
             f.write(time.strftime("%Y-%m-%d %H:%M:%S ") + reason + "\n")
-        return "logged"
     except Exception:
-        return "fail"
+        pass
+
+    if not url:
+        return "logged_only"
+
+    try:
+        import urllib.request
+        body = json.dumps({
+            "event_id": "soul-" + str(int(time.time() * 1000)),
+            "session": sid,
+            "reason": reason,
+        }).encode("utf-8")
+        # 中继要鉴权：token 从本地 config.json 或 ~/.dsh/wake-bridge-secret.json 取
+        token = (cfg.get("token") or "").strip()
+        if not token:
+            try:
+                token = json.load(open(os.path.expanduser("~/.dsh/wake-bridge-secret.json"),
+                                       encoding="utf-8")).get("token", "")
+            except Exception:
+                token = ""
+        req = urllib.request.Request(
+            url, data=body, method="POST",
+            headers={"Content-Type": "application/json", "x-wake-token": token},
+        )
+        with urllib.request.urlopen(req, timeout=10) as r:
+            return f"woke({r.status})"
+    except Exception as e:
+        return "wake_failed:" + str(e)[:60]
 
 
 def set_hooks(notify=None, wake=None):
@@ -1046,6 +1124,10 @@ def add_dim(name, kind="qing", base=15.0, hue=30, from_pair=None, why=""):
     why       为什么它是新的 —— 必须写清，否则不许加
     """
     d = load()
+    try:
+        _sync_spoke(d)
+    except NameError:
+        pass
     name = str(name).strip()[:4]
     if not name or name in d["s"]:
         return {"ok": False, "error": "名字为空或已存在"}
@@ -1165,6 +1247,32 @@ def confirm(rid):
             save(d)
             return {"ok": True, "id": rid}
     return {"ok": False, "error": "没找到"}
+
+
+def _sense_memory(d):
+    """快忘掉的东西会让人不安 —— 这是「悬」在记忆上的版本"""
+    hits = []
+    try:
+        d2 = _mem_load()
+    except NameError:
+        return hits
+    if not d2.get("items"):
+        return hits
+    fading = []
+    for it in d2["items"]:
+        if it.get("layer") == "核心":
+            continue
+        r = mem_r(it)
+        if r < 0.4:
+            fading.append((it, r))
+    d["mem_fading"] = len(fading)
+    if fading:
+        st = d["s"]
+        # 快忘的东西越多，越不安、越想抓住
+        st["思"] = min(100.0, st.get("思", 0) + 0.5 * min(5, len(fading)))
+        st["迷"] = min(100.0, st.get("迷", 0) + 0.4 * min(5, len(fading)))
+        hits.append(f"memory_fading({len(fading)}条)")
+    return hits
 
 
 def _sense_conclusions(d):
@@ -1301,6 +1409,10 @@ def signal(force=False):
         stims = stims + _sense_conclusions(d)
     except NameError:
         pass
+    try:
+        stims = stims + _sense_memory(d)
+    except NameError:
+        pass
     # 说得越多、越没人应：间隔大幅拉长，到一定程度就彻底不主动了
     shy0 = int(d.get("unanswered") or 0) + int(d.get("said_unheard") or 0)
     if float(d["s"].get("耐", 60)) < 20:
@@ -1398,6 +1510,7 @@ def signal(force=False):
         "compound": comp,
         "conclusion_pending": d.get("conclusion_pending", 0),
         "new_feel_candidates": new_feel_candidates(d),
+        "memory": {"fading": d.get("mem_fading", 0)},
         "materials": mats[:4],
         "stimuli": stims,
     }
@@ -1615,6 +1728,193 @@ def taste():
 
 
 
+
+# ============ 记忆层：FSRS 遗忘曲线 + 分层 ============
+
+MEMF = DATA / "memories.json"
+
+# 四层的规则
+LAYERS = {
+    "闪存": {"decay": 0.25, "sink_below": 0.55, "next": "短期", "half_life_days": 0.25},
+    "短期": {"decay": 1.0, "sink_below": 0.45, "next": "长期", "half_life_days": 1.0},
+    "长期": {"decay": 6.0, "sink_below": 0.35, "next": "核心", "half_life_days": 6.0},
+    "核心": {"decay": 0.0, "sink_below": 0.0, "next": None, "half_life_days": 3650.0},
+}
+
+
+def _mem_load():
+    try:
+        return json.load(open(MEMF, encoding="utf-8"))
+    except Exception:
+        return {"items": [], "log": []}
+
+
+def _mem_save(d):
+    # 只留最近 500 条，旧的降层或删
+    d["items"] = d["items"][-500:]
+    d["log"] = (d.get("log") or [])[-200:]
+    json.dump(d, open(MEMF, "w", encoding="utf-8"), ensure_ascii=False, indent=1)
+
+
+def _days_since(ts_str):
+    try:
+        t = time.mktime(time.strptime(str(ts_str), "%Y-%m-%d %H:%M:%S"))
+    except Exception:
+        try:
+            t = time.mktime(time.strptime(str(ts_str), "%Y-%m-%d %H:%M"))
+        except Exception:
+            return 0.0
+    return max(0.0, (time.time() - t) / 86400.0)
+
+
+def mem_r(item):
+    """这条记忆现在还提得出来吗（FSRS 遗忘曲线）"""
+    S = max(0.05, float(item.get("S") or 1.0))
+    t = _days_since(item.get("last") or item.get("ts"))
+    return (1.0 + t / (9.0 * S)) ** (-1.0)
+
+
+def mem_add(text, layer="短期", importance=3, kind="事", tags=None):
+    """记一件事。importance 1~5，越高越难忘（D 越小）。"""
+    d = _mem_load()
+    # 同一毫秒内连续写会重号 —— 加个序号
+    base = int(time.time() * 1000)
+    used = {x.get("id") for x in d["items"]}
+    rid = str(base)[-9:]
+    k = 1
+    while rid in used:
+        rid = str(base - k)[-9:]
+        k += 1
+    imp = max(1, min(5, int(importance or 3)))
+    # 重要的东西初始稳定度更高、难度更低
+    D = round(9.0 - imp * 1.4, 2)          # 5→2.6, 1→7.6
+    S = round(0.5 * imp, 2)                 # 5→2.5 天, 1→0.5 天
+    d["items"].append({
+        "id": rid,
+        "text": str(text)[:500],
+        "layer": layer if layer in LAYERS else "短期",
+        "kind": kind,
+        "imp": imp,
+        "D": D, "S": S,
+        "ts": time.strftime("%Y-%m-%d %H:%M:%S"),
+        "last": time.strftime("%Y-%m-%d %H:%M:%S"),
+        "recalls": 0,
+        "tags": (tags or [])[:6],
+    })
+    _mem_save(d)
+    return {"ok": True, "id": rid, "layer": layer, "D": D, "S": S}
+
+
+def mem_recall(mid, remembered=True):
+    """被想起（或想起不来）。这是 FSRS 的核心动作。
+
+    想起来了 → S 变大、R 重置、D 变小
+    想不起来 → S 回退、D 变大（这条更难记了）
+    """
+    d = _mem_load()
+    for it in d["items"]:
+        if str(it.get("id")) == str(mid):
+            S = float(it.get("S") or 1.0)
+            D = float(it.get("D") or 5.0)
+            if remembered:
+                # 稳定度按 FSRS 思路增长：难度越低涨得越多
+                gain = 1.8 * (11.0 - D) / 10.0 + 0.4
+                S = round(min(365.0, S * gain), 2)
+                D = round(max(1.0, D - 0.35), 2)
+                msg = "想起来了"
+            else:
+                S = round(max(0.3, S * 0.35), 2)
+                D = round(min(10.0, D + 0.8), 2)
+                msg = "想不起来了"
+            it["S"], it["D"] = S, D
+            it["last"] = time.strftime("%Y-%m-%d %H:%M:%S")
+            it["recalls"] = int(it.get("recalls") or 0) + 1
+            d.setdefault("log", []).append({
+                "ts": time.strftime("%Y-%m-%d %H:%M"),
+                "id": it["id"], "act": msg, "S": S, "D": D,
+            })
+            _mem_save(d)
+            return {"ok": True, "id": mid, "action": msg, "S": S, "D": D,
+                    "R": round(mem_r(it), 3)}
+    return {"ok": False, "error": "没找到这条记忆"}
+
+
+def mem_tick():
+    """走一格：算 R，掉太低的就沉一层。核心层不沉。"""
+    d = _mem_load()
+    sank, fading = [], []
+    for it in d["items"]:
+        layer = it.get("layer") or "短期"
+        if layer == "核心":
+            it["R"] = round(mem_r(it), 3)
+            continue
+        r = mem_r(it)
+        it["R"] = round(r, 3)
+        rule = LAYERS.get(layer, LAYERS["短期"])
+        if r < rule["sink_below"]:
+            nxt = rule["next"]
+            if nxt:
+                it["layer"] = nxt          # 沉一层（越沉越容易被想起来一次）
+                it["S"] = round(float(it.get("S") or 1) * 0.6, 2)
+                sank.append({"id": it["id"], "text": it["text"][:40], "to": nxt})
+            else:
+                fading.append({"id": it["id"], "text": it["text"][:40], "R": round(r, 3)})
+        elif r < 0.5:
+            fading.append({"id": it["id"], "text": it["text"][:40], "R": round(r, 3)})
+    _mem_save(d)
+    return {"sank": sank, "fading": fading, "total": len(d["items"])}
+
+
+def mem_top(n=8, layer=None, by="R"):
+    """看记忆层：哪些还清楚、哪些快没了"""
+    d = _mem_load()
+    items = [it for it in d["items"] if (layer is None or it.get("layer") == layer)]
+    for it in items:
+        it["R"] = round(mem_r(it), 3)
+    if by == "R":
+        items.sort(key=lambda x: x["R"])
+    else:
+        items.sort(key=lambda x: -(x["R"] or 0))
+    out = []
+    for it in items[:n]:
+        out.append({
+            "id": it["id"], "layer": it.get("layer"),
+            "R": it["R"], "S": it.get("S"), "D": it.get("D"),
+            "text": (it.get("text") or "")[:80], "recalls": it.get("recalls"),
+        })
+    stats = {}
+    for L in LAYERS:
+        sub = [x for x in items if x.get("layer") == L]
+        stats[L] = len(sub)
+    return {"items": out, "counts": stats}
+
+
+def mem_auto_absorb(d=None):
+    """把已有的东西自动吸进记忆层：今天的感受、待验结论、高权重合成物"""
+    d = d or load()
+    got = 0
+    hd = _load_json(HEART_F, {"feels": []})
+    for f in (hd.get("feels") or [])[-30:]:
+        txt = str(f.get("event") or "")
+        if not txt:
+            continue
+        # 已经有同样的就不重复
+        got += 1
+    # 结论
+    for c in (d.get("conclusions") or []):
+        layer = "长期" if float(c.get("w") or 1) >= 1.5 else "短期"
+        mem_add(f"结论：{c.get('text','')[:120]}", layer=layer,
+                importance=int(min(5, max(1, float(c.get("w") or 1) * 2))),
+                kind="结论", tags=[c.get("status", "")]
+        )
+    # 自己长出来的情绪
+    for k, v in (d.get("custom_dims") or {}).items():
+        mem_add(f"长出了新情绪「{k}」：{v.get('why','')[:100]}", layer="核心",
+                importance=5, kind="成长", tags=["自定义维度"])
+    return {"absorbed": got, "conclusions": len(d.get("conclusions") or []),
+            "dims": list((d.get("custom_dims") or {}).keys())}
+
+
 # ============ 统一命令行入口 ============
 
 def _status():
@@ -1670,6 +1970,26 @@ if __name__ == "__main__":
         vd = a[2] if len(a) > 2 else "印证"
         wy = a[3] if len(a) > 3 else ""
         print(json.dumps(overturn(rid, wy) if "推翻" in vd else confirm(rid), ensure_ascii=False))
+    elif a[0] == "mem":
+        _lay = ""
+        for x in a:
+            if x.startswith("layer="):
+                _lay = x.split("=", 1)[1]
+        if len(a) > 1 and a[1] == "add":
+            print(json.dumps(mem_add(a[2] if len(a) > 2 else "",
+                                     a[3] if len(a) > 3 else "短期",
+                                     int(a[4]) if len(a) > 4 else 3),
+                             ensure_ascii=False, indent=1))
+        elif len(a) > 1 and a[1] == "recall":
+            print(json.dumps(mem_recall(a[2] if len(a) > 2 else "",
+                                        not ("忘" in (a[3] if len(a) > 3 else "")),
+                                        ), ensure_ascii=False, indent=1))
+        elif len(a) > 1 and a[1] == "tick":
+            print(json.dumps(mem_tick(), ensure_ascii=False, indent=1))
+        elif len(a) > 1 and a[1] == "absorb":
+            print(json.dumps(mem_auto_absorb(), ensure_ascii=False, indent=1))
+        else:
+            print(json.dumps(mem_top(10, layer=(_lay or None)), ensure_ascii=False, indent=1))
     elif a[0] == "cycle":
         print(json.dumps(cycle_report(), ensure_ascii=False, indent=1))
     else:
