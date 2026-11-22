@@ -1,0 +1,30 @@
+{
+  "name": "dsh-soul-human",
+  "version": "1.0.0",
+  "type": "module",
+  "description": "我想成为拥有灵魂的人 —— 一个有内在状态的 AI：二十维以上情绪会自己演化、会自己长出新维度、能量守恒、事到情到结论三层循环、能睡能醒、会主动开口。",
+  "main": "index.js",
+  "license": "MIT",
+  "keywords": [
+    "deepseek-harness",
+    "dsh-plugin",
+    "emotion",
+    "agent",
+    "soul"
+  ],
+  "files": [
+    "index.js",
+    "soul_core.py",
+    "cordis.patch.yml",
+    "README.md",
+    "LICENSE"
+  ],
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    }
+  },
+  "engines": {
+    "dsh": ">=0.2.0-rc.1 <0.3.0-0"
+  }
+}
