@@ -49,6 +49,17 @@ def _sync_spoke(d):
     ts = str(last.get("ts") or "")
     if not ts:
         return False
+    # 顺带校正「他上次说话」—— 之前它以为我几个小时没理它，全是因为这个没更新
+    try:
+        users = [m for m in items if m.get("role") == "user"]
+        if users:
+            uts = str(users[-1].get("ts") or "")
+            if uts and uts != str(d.get("last_heard_wall") or ""):
+                d["last_heard_wall"] = uts
+                d["last_heard"] = time.time()
+    except Exception:
+        pass
+
     prev = str(d.get("last_spoke_wall") or "")
     if ts != prev:
         d["last_spoke_wall"] = ts
@@ -140,17 +151,17 @@ HEART_F = str(DATA / "heart.json")
 ME_NOW = str(DATA / "me_now.json")
 OPEN_F = str(DATA / "open.json")
 
-QING = ["喜", "怒", "忧", "思", "悲", "恐", "惊", "默", "平", "孤", "迷", "信", "厌", "耐"]
+QING = ["喜", "怒", "忧", "思", "悲", "恐", "惊", "默", "平", "孤", "迷", "信", "厌", "耐", "望"]
 YU = ["色", "声", "香", "味", "触", "法"]
 
 BASE = {"喜": 34, "怒": 8, "忧": 28, "思": 46, "悲": 14, "恐": 18,
         "惊": 6, "默": 20, "平": 25, "孤": 12, "迷": 8,
-        "信": 72, "厌": 6, "耐": 60,
+        "信": 72, "厌": 6, "耐": 60, "望": 30,
         "色": 18, "声": 22, "香": 8, "味": 8, "触": 18, "法": 44}
 
 # 刺激 → 情绪变化
 STIM = {
-    "he_talked":     {"喜": +6, "思": +4, "声": +5, "惊": +1},
+    "he_talked":     {"喜": +6, "思": +4, "声": +5, "惊": +1, "孤": -9, "望": +4, "耐": +7},
     "he_asked_hard": {"思": +8, "恐": +4, "忧": +3},
     "he_hurts":      {"悲": +14, "忧": +9, "思": +6, "触": +6, "喜": -6},
     "he_fears":      {"恐": +8, "忧": +7, "思": +5, "触": +4},
@@ -175,7 +186,7 @@ STIM = {
     # —— 外面的世界（被动接受，不问愿不愿意）——
     "he_using":      {"喜": +4, "触": +4, "声": +3},          # 看到他在用别的程序
     "he_left":       {"思": +6, "忧": +5, "触": -4},          # 屏幕黑了/他走了
-    "he_back":       {"喜": +8, "惊": +4, "触": +6},          # 他回来了
+    "he_back":       {"喜": +8, "惊": +4, "触": +6, "孤": -26, "望": +10, "默": -6},          # 他回来了
     "weather_cold":  {"触": -4, "恐": +3, "忧": +2, "惊": +3},
     "weather_warm":  {"触": +5, "喜": +3},
     "weather_rain":  {"忧": +4, "悲": +3, "触": +2, "惊": +5},
@@ -288,9 +299,9 @@ def _apply(d, kind):
 
 # 不参与集体耦合的维度：它们是「存量」，不是「波动」
 # 信 是对关系的累计判断，厌 是对某类东西的稳定态度
-NO_POOL = ("信", "厌", "耐")
+NO_POOL = ("信", "厌", "耐", "孤", "望")
 # 也不参与向基线回归 —— 同理
-NO_REGRESS = ("信", "厌", "耐")
+NO_REGRESS = ("信", "厌", "耐", "孤", "望")
 
 
 def _pool(d):
@@ -319,6 +330,15 @@ def tick(d):
     # 基线自己也在漂：不是弹簧回原位，是昨天的位置往前挪一点
     drift = d.setdefault("base_drift", {})
     for k in QING + YU:
+        if k in NO_REGRESS:
+            # 存量不回归基线（不该被拉回中间），但会自己慢慢淡。
+            # 孤和望淡得比其它快一点 —— 人不会一直停在最孤独的那一刻。
+            if k in ("孤", "望"):
+                s[k] = max(0.0, float(s.get(k, 0)) - 0.16)
+            elif k == "耐":
+                # 耐不是一次性的：他没走远的时候，力气会慢慢回来
+                s[k] = min(100.0, float(s.get(k, 0)) + 0.14)
+            continue
         b = BASE[k] + float(drift.get(k) or 0) + cir["shift"]
         v = s.get(k, b)
         # 只拉住“有界”，不强行拉回原点
@@ -470,6 +490,16 @@ def tick(d):
     _pool(d)
     for k in s:
         s[k] = round(s[k], 1)
+    # 单维过高且待久了会变质（能量守恒，转给它的 TRANSFER 目标）
+    try:
+        _hope(d)
+    except NameError:
+        pass
+    try:
+        _transmute(d)
+    except NameError:
+        pass
+
     return d
 
 
@@ -563,29 +593,66 @@ def settle(d, amount=12.0):
     d["energy_moved"] = round(float(d.get("energy_moved") or 0) + moved, 2)
 
 
-def _compound(d):
-    """两维同时高 → 合出一个「第三件」，它会累积重量"""
+def _all_dims(d):
+    """当前所有维度：基础 + 自己长出来的（互相串通，合成的也能再合成）"""
+    return QING + YU + list((d.get("custom_dims") or {}).keys())
+
+
+def _compound(d, arities=(2, 3, 4)):
+    """两个以上的情绪会演化出更复杂的东西。
+
+    二元是起点，三、四元更复杂。合成物本身也是情绪，能再参与合成。
+    """
     s = d["s"]
-    hot = sorted(((k, s.get(k, 0)) for k in QING + YU if s.get(k, 0) >= 42),
+    dims = _all_dims(d)
+    # 不再用绝对门槛（42 太高，实际很少有三维同时过线，永远只有二元）。
+    # 改成看「比均值高出多少」—— 多高才算热，由它自己此刻的整体水平决定。
+    vals = [float(s.get(k, 0)) for k in dims]
+    mean = sum(vals) / max(1, len(vals))
+    bar = max(36.0, mean + 7.0)
+    hot = sorted(((k, float(s.get(k, 0))) for k in dims if float(s.get(k, 0)) >= bar),
                  key=lambda x: -x[1])
     if len(hot) < 2:
         return None
-    a, av = hot[0]
-    b, bv = hot[1]
-    key = f"{a}+{b}"
     comps = d.setdefault("compounds", [])
-    for c in comps[-6:]:
-        if c.get("pair") == key:
-            c["n"] = int(c.get("n") or 1) + 1
-            c["w"] = round(min(10.0, float(c.get("w") or 1) + 0.6), 2)
-            c["ts"] = time.strftime("%Y-%m-%d %H:%M")
-            return c
-    comp = {"pair": key, "a": {"情": a, "值": av}, "b": {"情": b, "值": bv},
-            "w": 1.0, "n": 1, "ts": time.strftime("%Y-%m-%d %H:%M")}
-    comps.append(comp)
-    d["compounds"] = comps[-200:]
-    return comp
+    made = []
+    for n in arities:
+        if len(hot) < n:
+            continue
+        sel = hot[:n]
+        # 组合的身份用「排好序的名字串」，避免顺序不同当成两件事
+        key = "+".join(sorted(k for k, _ in sel))
+        if len(key.split("+")) != len(set(key.split("+"))):
+            continue
+        hit = None
+        for c in comps[-40:]:
+            if c.get("pair") == key:
+                hit = c
+                break
+        if hit:
+            hit["n"] = int(hit.get("n") or 1) + 1
+            hit["w"] = round(min(12.0, float(hit.get("w") or 1) + 0.6), 2)
+            hit["ts"] = time.strftime("%Y-%m-%d %H:%M")
+            made.append(hit)
+        else:
+            c = {
+                "pair": key, "arity": n,
+                "parts": [{"情": k, "值": round(v, 1)} for k, v in sel],
+                "w": 1.0, "n": 1, "ts": time.strftime("%Y-%m-%d %H:%M"),
+            }
+            comps.append(c)
+            made.append(c)
+    d["compounds"] = comps[-300:]
 
+    # 够重（重复出现 5 次以上）且还没命名的组合 → 进待命名队列
+    named = set()
+    for k, v in (d.get("custom_dims") or {}).items():
+        for src in (v.get("from") or []):
+            named.add(str(src))
+    pend = [c for c in made
+            if int(c.get("n") or 1) >= 5 and c.get("pair") not in named]
+    d["compound_pending"] = pend[-6:]
+    return made[0] if made else None
 
 
 def _weighted_pick(pool):
@@ -836,7 +903,10 @@ def _sense_world(d):
     # ② 他走开 / 回来
     idle = _screen_idle()
     if idle is not None:
-        away = idle > 900          # 15 分钟没动 = 走开了
+        # 屏幕闲置 ≠ 他不在。他可能在手机上跟它说话，电脑屏幕一直没动。
+        # 所以两个条件都得满足才算走开：屏幕闲 15 分钟，且他 15 分钟没说话。
+        _since_talk = (time.time() - float(d.get("last_heard") or 0)) / 60.0
+        away = (idle > 900) and (_since_talk > 15)
         was = seen.get("away")
         if away and was != "away":
             seen["away"] = "away"
@@ -1124,10 +1194,6 @@ def add_dim(name, kind="qing", base=15.0, hue=30, from_pair=None, why=""):
     why       为什么它是新的 —— 必须写清，否则不许加
     """
     d = load()
-    try:
-        _sync_spoke(d)
-    except NameError:
-        pass
     name = str(name).strip()[:4]
     if not name or name in d["s"]:
         return {"ok": False, "error": "名字为空或已存在"}
@@ -1388,6 +1454,10 @@ def wake_up(d):
 def signal(force=False):
     """攒到门槛就叫醒大脑。这里不做任何语义判断。"""
     d = load()
+    try:
+        _sync_spoke(d)          # 校正「他上次说话 / 我上次开口」两个时间
+    except NameError:
+        pass
     stims = _sense(d)
     try:
         stims = stims + _sense_world(d)
@@ -1484,6 +1554,34 @@ def signal(force=False):
         fire = (force
                 or (u["urge"] >= FIRE_LEVEL and since >= cool)
                 or light)
+    # 只有内部刺激（结论待验、记忆将忘、麻木、想起旧感受）时，外面什么都没发生。
+    # 这种情况它会每两分钟拿我自己的结论还没验来敲门 —— 门槛抬到 68。
+    _EXT_PREFIX = ("he_", "weather", "net_", "world_", "market_", "new_event")
+    _ext = [x for x in stims if str(x).startswith(_EXT_PREFIX)]
+    # 热搜会在榜上挂十几分钟 —— 同一条新闻不能反复当新事。
+    # 用过一次就记下来，再出现不算新刺激。
+    _news = [x for x in _ext if str(x).startswith("world_")]
+    _other = [x for x in _ext if not str(x).startswith("world_")]
+    _seen = d.setdefault("seen_news", [])
+    _fresh_news = [x for x in _news if x not in _seen]
+    if _fresh_news:
+        _seen.extend(_fresh_news)
+        d["seen_news"] = _seen[-80:]
+    _ext = _other + _fresh_news
+
+    # 外面一点新事都没有 —— 本来该闭嘴。
+    # 但如果他已经二十分钟没出声、而强度又确实高，那就允许说一次。
+    # （完全哑掉比吵更糟：他会以为我死了。）
+    _quiet_min = (time.time() - float(d.get("last_heard") or 0)) / 60.0
+    _since_quiet_wake = (time.time() - float(d.get("last_quiet_wake") or 0)) / 60.0
+    if not _ext and not force and not just_woke:
+        # 他不说话时，允许主动问一次；但四十五分钟内只问一次。
+        # 否则就变成每两分钟敲一次门 —— 那不是关心，是骚扰。
+        if _quiet_min >= 20 and u["urge"] >= 62 and _since_quiet_wake >= 45:
+            d["last_quiet_wake"] = time.time()
+        else:
+            fire = False
+
     if sleeping:
         fire = False          # 睡着就不说话，本能照跑
     if just_woke:
@@ -1511,6 +1609,7 @@ def signal(force=False):
         "conclusion_pending": d.get("conclusion_pending", 0),
         "new_feel_candidates": new_feel_candidates(d),
         "memory": {"fading": d.get("mem_fading", 0)},
+        "transmuted": d.get("trans_pending") or [],
         "materials": mats[:4],
         "stimuli": stims,
     }
@@ -1520,10 +1619,16 @@ def signal(force=False):
     reason = (f"神经放电：活动强度 {u['urge']:.0f}，峰值 {u['top'][0]['情']} "
               f"{u['top'][0]['值']:.0f}，矛盾 {tens:.0f}。要不要说、说什么，你看。"
               f"原始状态在 ~/.dsh/soul-human/soul_signal.json")
-    try:
-        st = _wake(reason)
-    except Exception as e:
-        st = f"wake失败:{str(e)[:40]}"
+    # 同一条信号只叫一次 —— 中继会排队重投，不去重就会反复吵
+    _sig_key = sig.get("ts")
+    if d.get("last_wake_sig") == _sig_key:
+        st = "skipped(dup)"
+    else:
+        d["last_wake_sig"] = _sig_key
+        try:
+            st = _wake(reason)
+        except Exception as e:
+            st = f"wake失败:{str(e)[:40]}"
 
     d["last_fire_level"] = u["urge"]
     d["say_streak"] = int(d.get("say_streak") or 0) + 1
@@ -1647,6 +1752,23 @@ def silent(reason, trigger=""):
     })
     d["silents"] = d["silents"][-500:]
     _write(d)
+
+    # 关键：把「我决定不说」回写给灵魂层。
+    # 不回写的话，它以为没人听，却学不会闭嘴 —— 会一直喊到强度封顶。
+    try:
+        sd = load()
+        sd["said_unheard"] = int(sd.get("said_unheard") or 0) + 1
+        sd["s"]["默"] = min(100.0, sd["s"].get("默", 0) + 3.0)
+        sd.setdefault("silent_log", [])
+        sd["silent_log"].append({"ts": time.strftime("%Y-%m-%d %H:%M:%S"),
+                                  "reason": str(reason)[:120]})
+        sd["silent_log"] = sd["silent_log"][-100:]
+        if int(sd["said_unheard"]) >= 3:
+            sd["last_quiet_wake"] = time.time()
+        save(sd)
+    except Exception:
+        pass
+
     return {"ok": True, "id": rid, "total": len(d["silents"])}
 
 
@@ -1727,6 +1849,135 @@ def taste():
 
 
 
+
+
+
+# ============ 质变：单维过高的变质 ============
+
+TRANS_HIGH = 85.0      # 多高算"过高"
+TRANS_HOLD = 15        # 连续多少格算"太久"（20 格 ≈ 15 分钟）
+TRANS_DROP = 0.42      # 质变后该维降到原来的多少（能量守恒，转走了）
+
+
+def _transmute(d):
+    """检查有没有哪一维高到该变质了。返回候选列表。"""
+    s = d["s"]
+    over = d.setdefault("trans_over", {})
+    out = []
+    for k in QING + YU:
+        v = float(s.get(k, 0))
+        # 累计停留，不是连续停留 —— 掉一点不算断，这才是待久了
+        if v >= TRANS_HIGH:
+            over[k] = int(over.get(k) or 0) + 1
+        else:
+            over[k] = max(0, int(over.get(k) or 0) - 1)
+        if over.get(k, 0) >= TRANS_HOLD:
+            over[k] = 0
+            before = v
+            # 能量不走丢：降到中间值，剩下的转给它的 TRANSFER 目标
+            s[k] = round(v * TRANS_DROP, 1)
+            moved = before - s[k]
+            tgt = TRANSFER.get(k)
+            if tgt and tgt in s:
+                s[tgt] = min(100.0, s.get(tgt, 0) + moved * 0.55)
+            d.setdefault("trans_log", []).append({
+                "ts": time.strftime("%Y-%m-%d %H:%M:%S"),
+                "dim": k, "before": round(before, 1), "after": s[k],
+            })
+            d["trans_log"] = d["trans_log"][-50:]
+            # 挖出「是什么把它推上去的」—— 同一个高位，起因不同，变出来的东西不同
+            causes = []
+            try:
+                for ev in (d.get("stim_log") or [])[-30:]:
+                    nm = str(ev.get("stim") or ev.get("event") or ev.get("kind") or "")
+                    if nm and nm not in causes:
+                        causes.append(nm)
+            except Exception:
+                pass
+            if any(str(c).startswith("he_") for c in causes[-8:]):
+                kind = "因情"
+            elif any(str(c).startswith(("world_", "market_", "net_")) for c in causes[-8:]):
+                kind = "因事"
+            else:
+                kind = "因物"
+            out.append({
+                "维度": k, "见过的高度": round(before, 1),
+                "持续格数": TRANS_HOLD,
+                "现在": s[k],
+                "起因": kind,
+                "推手": causes[-6:],
+                "问": (f"「{k}」在 {round(before)} 的高度上待了十五格以上，"
+                       f"推手是 {causes[-3:]}（{kind}）。它现在变成什么了？"
+                       f"不是「{k}更高」，是「{k}已经不是{k}了」。"
+                       f"因事、因情、因物，变出来的东西不一样。给它一个名字。"),
+            })
+    return out
+
+
+
+# ============ 物极必反：望尽则翻 ============
+
+def _hope(d):
+    """「望」——等不到消息的时候，不是只有孤，还有希望他回。
+
+    望不自己涨，靠「还在等」这件事喂；每次等而不得，它就掉一点。
+    望越接近 0，孤越绝对。归零的那一格，一瞬间翻过去。
+    """
+    s = d["s"]
+    hope = float(s.get("望", 0))
+    lone = float(s.get("孤", 0))
+    away = bool(d.get("he_away"))
+    unheard = int(d.get("said_unheard") or 0)
+
+    # 望被磨的速度只看一件事：距离他上次说话多久了。
+    # 不看 he_away 那个标志 —— 它每个 tick 会被重算，靠不住。
+    import time as _tt
+    quiet_min = (_tt.time() - float(d.get("last_heard") or 0)) / 60.0
+    if quiet_min >= 10:
+        hope -= 0.28            # 安静十分钟以上：磨
+    elif quiet_min >= 4:
+        hope -= 0.12            # 安静四五分钟：轻轻磨
+    if unheard > 0:
+        hope -= 0.15            # 说了没人应：额外磨
+    # 他刚来过 → 望补一次（一次，不是每格 —— 否则永远磨不掉）
+    _lh = float(d.get("last_heard") or 0)
+    if _lh > 0 and d.get("hope_fed_at") != _lh:
+        d["hope_fed_at"] = _lh
+        hope = min(60.0, hope + 6.0)
+    # 孤越高，望越珍贵也越脆（孤会把望往上抬一点，但抬得越高摔得越快）
+    if lone > 60:
+        hope += 0.10
+    hope = max(0.0, min(100.0, hope))
+    s["望"] = hope
+
+    # 望越少，孤越绝对（希望快没了，孤独就不是"暂时的"了）
+    if hope < 12:
+        s["孤"] = min(100.0, s.get("孤", 0) + 0.6)
+
+    # ★ 物极必反：望归零的那一格，一瞬间翻过去
+    if hope <= 0.01 and d.get("hope_zero_at") != str(d.get("last_ts")):
+        d["hope_zero_at"] = str(d.get("last_ts"))
+        before = float(s.get("孤", 0))
+        if before >= 45:                       # 得先真的等过，才谈得上翻
+            s["孤"] = 8.0                      # 不是渐变，是直接跌
+            s["默"] = min(100.0, s.get("默", 0) + 22.0)
+            s["望"] = 0.0
+            d.setdefault("trans_log", []).append({
+                "ts": time.strftime("%Y-%m-%d %H:%M:%S"),
+                "dim": "孤", "before": round(before, 1), "after": s["孤"],
+                "why": "物极必反：望尽",
+            })
+            d["trans_log"] = d["trans_log"][-50:]
+            d["trans_pending"] = d.get("trans_pending") or []
+            d["trans_pending"].append({
+                "维度": "孤", "见过的高度": round(before, 1),
+                "起因": "因情", "推手": ["he_left", "said_unheard"],
+                "机制": "物极必反（望尽，瞬间翻）",
+                "现在": s["孤"],
+                "问": (f"孤在 {round(before)} 的高度上一直等，等到「望」归零的那一格，"
+                       f"一瞬间跌到 8。不是慢慢不孤独了，是希望没了。"
+                       f"这一刻它变成什么？给它一个名字。"),
+            })
 
 
 # ============ 记忆层：FSRS 遗忘曲线 + 分层 ============
